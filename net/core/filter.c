@@ -3326,6 +3326,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_ktime_get_ns_proto;
 	case BPF_FUNC_ktime_get_boot_ns:
 		return &bpf_ktime_get_boot_ns_proto;
+	case BPF_FUNC_ktime_get_coarse_ns:
+		return &bpf_ktime_get_coarse_ns_proto;
 	case BPF_FUNC_trace_printk:
 		if (capable(CAP_SYS_ADMIN))
 			return bpf_get_trace_printk_proto();
@@ -3604,6 +3606,17 @@ static bool bpf_skb_is_valid_access(int off, int size, enum bpf_access_type type
 		if (size != size_default)
 			return false;
 		break;
+	case bpf_ctx_range(struct __sk_buff, gso_segs):
+	case bpf_ctx_range(struct __sk_buff, gso_size):
+		if (type == BPF_WRITE || size != size_default)
+			return false;
+		break;
+	case bpf_ctx_range(struct __sk_buff, data_meta):
+	case bpf_ctx_range(struct __sk_buff, flow_keys):
+	case bpf_ctx_range(struct __sk_buff, tstamp):
+	case bpf_ctx_range(struct __sk_buff, wire_len):
+	case bpf_ctx_range(struct __sk_buff, sk):
+		return false;
 	default:
 		/* Only narrow read access allowed for now. */
 		if (type == BPF_WRITE) {
@@ -4314,6 +4327,52 @@ static u32 bpf_convert_ctx_access(enum bpf_access_type type,
 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
 				      bpf_target_off(struct sock_common,
 						     skc_num, 2, target_size));
+		break;
+
+	case offsetof(struct __sk_buff, gso_segs):
+		/* si->dst_reg = skb_shinfo(SKB); */
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, end),
+				      BPF_REG_AX, si->src_reg,
+				      offsetof(struct sk_buff, end));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, head),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct sk_buff, head));
+		*insn++ = BPF_ALU64_REG(BPF_ADD, si->dst_reg, BPF_REG_AX);
+#else
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, end),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct sk_buff, end));
+#endif
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct skb_shared_info,
+							    gso_segs),
+				      si->dst_reg, si->dst_reg,
+				      bpf_target_off(struct skb_shared_info,
+						     gso_segs, 2,
+						     target_size));
+		break;
+
+	case offsetof(struct __sk_buff, gso_size):
+		/* si->dst_reg = skb_shinfo(SKB); */
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, end),
+				      BPF_REG_AX, si->src_reg,
+				      offsetof(struct sk_buff, end));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, head),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct sk_buff, head));
+		*insn++ = BPF_ALU64_REG(BPF_ADD, si->dst_reg, BPF_REG_AX);
+#else
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, end),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct sk_buff, end));
+#endif
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct skb_shared_info,
+							    gso_size),
+				      si->dst_reg, si->dst_reg,
+				      bpf_target_off(struct skb_shared_info,
+						     gso_size, 2,
+						     target_size));
 		break;
 	}
 

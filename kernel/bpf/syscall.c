@@ -235,6 +235,7 @@ static void __bpf_map_put(struct bpf_map *map, bool do_idr_lock)
 	if (atomic_dec_and_test(&map->refcnt)) {
 		/* bpf_map_free_id() must be called first */
 		bpf_map_free_id(map, do_idr_lock);
+		btf_put(map->btf);
 		INIT_WORK(&map->work, bpf_map_free_deferred);
 		schedule_work(&map->work);
 	}
@@ -317,6 +318,29 @@ static ssize_t bpf_dummy_write(struct file *filp, const char __user *buf,
 	return -EINVAL;
 }
 
+static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct bpf_map *map = filp->private_data;
+
+	if (!map->ops->map_mmap)
+		return -ENOTSUPP;
+	if (!(vma->vm_flags & VM_SHARED))
+		return -EINVAL;
+
+	vma->vm_flags &= ~VM_MAYEXEC;
+	return map->ops->map_mmap(map, vma);
+}
+
+static unsigned int bpf_map_poll(struct file *filp,
+				 struct poll_table_struct *pts)
+{
+	struct bpf_map *map = filp->private_data;
+
+	if (map->ops->map_poll)
+		return map->ops->map_poll(map, filp, pts);
+	return POLLERR;
+}
+
 const struct file_operations bpf_map_fops = {
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= bpf_map_show_fdinfo,
@@ -324,6 +348,8 @@ const struct file_operations bpf_map_fops = {
 	.release	= bpf_map_release,
 	.read		= bpf_dummy_read,
 	.write		= bpf_dummy_write,
+	.mmap		= bpf_map_mmap,
+	.poll		= bpf_map_poll,
 };
 
 int bpf_map_new_fd(struct bpf_map *map, int flags)
@@ -379,8 +405,24 @@ static int bpf_obj_name_cpy(char *dst, const char *src)
 
 	return 0;
 }
+static int map_check_btf(const struct bpf_map *map, const struct btf *btf,
+			 u32 btf_key_id, u32 btf_value_id)
+{
+	const struct btf_type *key_type, *value_type;
+	u32 key_size, value_size;
 
-#define BPF_MAP_CREATE_LAST_FIELD map_name
+	key_type = btf_type_id_size(btf, &btf_key_id, &key_size);
+	if (!key_type || key_size != map->key_size)
+		return -EINVAL;
+
+	value_type = btf_type_id_size(btf, &btf_value_id, &value_size);
+	if (!value_type || value_size != map->value_size)
+		return -EINVAL;
+
+	return 0;
+}
+
+#define BPF_MAP_CREATE_LAST_FIELD btf_value_type_id
 /* called via syscall */
 static int map_create(union bpf_attr *attr)
 {
@@ -414,6 +456,32 @@ static int map_create(union bpf_attr *attr)
 	atomic_set(&map->refcnt, 1);
 	atomic_set(&map->usercnt, 1);
 
+	if (attr->btf_key_type_id || attr->btf_value_type_id) {
+		struct btf *btf;
+
+		if (!attr->btf_key_type_id || !attr->btf_value_type_id) {
+			err = -EINVAL;
+			goto free_map_nouncharge;
+		}
+
+		btf = btf_get_by_fd(attr->btf_fd);
+		if (IS_ERR(btf)) {
+			err = PTR_ERR(btf);
+			goto free_map_nouncharge;
+		}
+
+		err = map_check_btf(map, btf, attr->btf_key_type_id,
+				    attr->btf_value_type_id);
+		if (err) {
+			btf_put(btf);
+			goto free_map_nouncharge;
+		}
+
+		map->btf = btf;
+		map->btf_key_type_id = attr->btf_key_type_id;
+		map->btf_value_type_id = attr->btf_value_type_id;
+	}
+
 	err = security_bpf_map_alloc(map);
 	if (err)
 		goto free_map_nouncharge;
@@ -446,6 +514,7 @@ free_map:
 free_map_sec:
 	security_bpf_map_free(map);
 free_map_nouncharge:
+	btf_put(map->btf);
 	map->ops->map_free(map);
 	return err;
 }
@@ -1894,6 +1963,7 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 		err = -EINVAL;
 		break;
 	}
+
 
 	return err;
 }

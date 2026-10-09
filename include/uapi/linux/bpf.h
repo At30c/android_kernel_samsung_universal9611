@@ -115,6 +115,7 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_DEVMAP,
 	BPF_MAP_TYPE_SOCKMAP,
 	BPF_MAP_TYPE_DEVMAP_HASH = 25,
+	BPF_MAP_TYPE_RINGBUF = 27,
 };
 
 enum bpf_prog_type {
@@ -209,6 +210,13 @@ enum bpf_attach_type {
 
 #define BPF_PSEUDO_MAP_FD	1
 
+/* when bpf_ldimm64->src_reg == BPF_PSEUDO_MAP_VALUE, bpf_ldimm64->imm == fd
+ * of a map and the second insn's imm == offset into its value. The ldimm64
+ * resolves to the address of the map value (map[off]) and the verifier
+ * tracks it as PTR_TO_MAP_VALUE.
+ */
+#define BPF_PSEUDO_MAP_VALUE	2
+
 /* flags for BPF_MAP_UPDATE_ELEM command */
 #define BPF_ANY		0 /* create new element or update existing */
 #define BPF_NOEXIST	1 /* create new element if it didn't exist */
@@ -252,6 +260,10 @@ union bpf_attr {
 					 * BPF_F_NUMA_NODE is set).
 					 */
 		char	map_name[BPF_OBJ_NAME_LEN];
+		__u32	map_ifindex;	/* ifindex of netdev to create on */
+		__u32	btf_fd;		/* fd pointing to a BTF type data */
+		__u32	btf_key_type_id;	/* BTF type_id of the key */
+		__u32	btf_value_type_id;	/* BTF type_id of the value */
 	};
 
 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
@@ -830,7 +842,42 @@ union bpf_attr {
 	FN(get_netns_cookie),		\
 	FN(get_current_ancestor_cgroup_id),	\
 	FN(sk_assign),			\
-	FN(ktime_get_boot_ns),
+	FN(ktime_get_boot_ns),		\
+	FN(seq_printf),			\
+	FN(seq_write),			\
+	FN(sk_cgroup_id),		\
+	FN(sk_ancestor_cgroup_id),	\
+	FN(ringbuf_output),		\
+	FN(ringbuf_reserve),		\
+	FN(ringbuf_submit),		\
+	FN(ringbuf_discard),		\
+	FN(ringbuf_query),		\
+	FN(csum_level),			\
+	FN(skc_to_tcp6_sock),		\
+	FN(skc_to_tcp_sock),		\
+	FN(skc_to_tcp_timewait_sock),	\
+	FN(skc_to_tcp_request_sock),	\
+	FN(skc_to_udp6_sock),		\
+	FN(get_task_stack),		\
+	FN(load_hdr_opt),		\
+	FN(store_hdr_opt),		\
+	FN(reserve_hdr_opt),		\
+	FN(inode_storage_get),		\
+	FN(inode_storage_delete),	\
+	FN(d_path),			\
+	FN(copy_from_user),		\
+	FN(snprintf_btf),		\
+	FN(seq_printf_btf),		\
+	FN(skb_cgroup_classid),	\
+	FN(redirect_neigh),		\
+	FN(per_cpu_ptr),		\
+	FN(this_cpu_ptr),		\
+	FN(redirect_peer),		\
+	FN(task_storage_get),		\
+	FN(task_storage_delete),	\
+	FN(get_current_task_btf),	\
+	FN(bprm_opts_set),		\
+	FN(ktime_get_coarse_ns),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call
@@ -843,6 +890,29 @@ enum bpf_func_id {
 #undef __BPF_ENUM_FN
 
 /* All flags used by eBPF helper functions, placed here. */
+
+/* BPF_FUNC_ringbuf_submit, BPF_FUNC_ringbuf_discard and
+ * BPF_FUNC_ringbuf_output flags.
+ */
+enum {
+	BPF_RB_NO_WAKEUP	= (1ULL << 0),
+	BPF_RB_FORCE_WAKEUP	= (1ULL << 1),
+};
+
+/* BPF_FUNC_ringbuf_query flags. */
+enum {
+	BPF_RB_AVAIL_DATA = 0,
+	BPF_RB_RING_SIZE = 1,
+	BPF_RB_CONS_POS = 2,
+	BPF_RB_PROD_POS = 3,
+};
+
+/* Ring buffer record header layout shared with userspace. */
+enum {
+	BPF_RINGBUF_BUSY_BIT	 = (1U << 31),
+	BPF_RINGBUF_DISCARD_BIT = (1U << 30),
+	BPF_RINGBUF_HDR_SZ	 = 8,
+};
 
 /* BPF_FUNC_skb_store_bytes flags. */
 #define BPF_F_RECOMPUTE_CSUM		(1ULL << 0)
@@ -891,6 +961,12 @@ enum bpf_hdr_start_off {
 	BPF_HDR_START_NET,
 };
 
+#define __bpf_md_ptr(type, name)	\
+union {					\
+	type name;			\
+	__u64 :64;			\
+} __attribute__((aligned(8)))
+
 /* user accessible mirror of in-kernel sk_buff.
  * new fields can only be added to the end of this structure
  */
@@ -922,6 +998,14 @@ struct __sk_buff {
 	__u32 local_ip6[4];	/* Stored in network byte order */
 	__u32 remote_port;	/* Stored in network byte order */
 	__u32 local_port;	/* stored in host byte order */
+
+	__u32 data_meta;
+	__bpf_md_ptr(struct bpf_flow_keys *, flow_keys);
+	__u64 tstamp;
+	__u32 wire_len;
+	__u32 gso_segs;
+	__bpf_md_ptr(struct bpf_sock *, sk);
+	__u32 gso_size;
 };
 
 struct bpf_tunnel_key {

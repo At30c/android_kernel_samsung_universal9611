@@ -79,6 +79,9 @@ struct bpf_reg_state {
 	s64 smax_value; /* maximum possible (s64)value */
 	u64 umin_value; /* minimum possible (u64)value */
 	u64 umax_value; /* maximum possible (u64)value */
+	u32 mem_size;	/* Size of memory pointed to by this register (for
+			 * PTR_TO_MEM[_OR_NULL] returned by bpf_ringbuf_reserve()).
+			 */
 	/* This field must be last, for states_equal() reasons. */
 	enum bpf_reg_liveness live;
 };
@@ -101,10 +104,41 @@ struct bpf_stack_state {
  */
 struct bpf_verifier_state {
 	struct bpf_reg_state regs[MAX_BPF_REG];
+	/* 'parent' is the state whose straight-line code leads to this state;
+	 * it is the chain used for register liveness propagation.  It is NOT
+	 * the same relation as 'branch_parent' below.
+	 */
 	struct bpf_verifier_state *parent;
 	int allocated_stack;
 	struct bpf_stack_state *stack;
 	bool speculative;
+	/*
+	 * Bounded loop support (backport of "bpf: introduce bounded loops").
+	 *
+	 * 'branches' is the number of branches left to explore:
+	 * 0 - all possible paths from this state reached bpf_exit or
+	 * were safely pruned
+	 * 1 - at least one path is being explored.
+	 * 2 - this state is an immediate parent of two children: one is the
+	 * fallthrough branch and the other was pushed into the stack to be
+	 * explored later.
+	 *
+	 * Once do_check() reaches bpf_exit it calls update_branch_counts(),
+	 * which decrements the counters walking up the 'branch_parent' chain.
+	 * A recorded state is only eligible for equivalence-based pruning once
+	 * its 'branches' has dropped back to zero, i.e. after all of its
+	 * descendant paths have been fully verified.
+	 *
+	 * If is_state_visited() sees such a fully-verified state that is also
+	 * exactly equal to the current state, the program loops forever and is
+	 * rejected.  states_maybe_looping() is a cheaper pre-check for that.
+	 *
+	 * This may not find every infinite loop, and a loop may legitimately
+	 * need many iterations; in those cases the BPF_COMPLEXITY_LIMIT_INSNS
+	 * budget kicks in and the load fails with -E2BIG.
+	 */
+	u32 branches;
+	struct bpf_verifier_state *branch_parent;
 };
 
 /* linked list of verifier states used to prune search */
@@ -132,6 +166,8 @@ struct bpf_insn_aux_data {
 	int sanitize_stack_off; /* stack slot to be cleared */
 	bool seen; /* this insn was processed by the verifier */
 	u8 alu_state; /* used in combination with alu_limit */
+	u32 map_index; /* index into env->used_maps for BPF_PSEUDO_*_VALUE */
+	s32 map_off; /* map value offset for BPF_PSEUDO_MAP_VALUE */
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -189,6 +225,10 @@ struct bpf_verifier_env {
 	bool allow_ptr_leaks;
 	bool seen_direct_write;
 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+	/* number of instructions analyzed by the verifier */
+	u32 prev_insn_processed, insn_processed;
+	/* number of jmps/calls/exits analyzed so far */
+	u32 prev_jmps_processed, jmps_processed;
 };
 
 static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)

@@ -140,8 +140,8 @@ struct bpf_verifier_stack_elem {
 	struct bpf_verifier_stack_elem *next;
 };
 
-#define BPF_COMPLEXITY_LIMIT_INSNS	131072
-#define BPF_COMPLEXITY_LIMIT_STACK	1024
+#define BPF_COMPLEXITY_LIMIT_INSNS	1000000
+#define BPF_COMPLEXITY_LIMIT_STACK	8192
 
 #define BPF_MAP_PTR_POISON ((void *)0xeB9F + POISON_POINTER_DELTA)
 
@@ -151,6 +151,7 @@ struct bpf_call_arg_meta {
 	bool pkt_access;
 	int regno;
 	int access_size;
+	u64 msize_max_value;
 };
 
 /* verbose verifier prints what it's seeing
@@ -208,7 +209,8 @@ static __printf(1, 2) void verbose(const char *fmt, ...)
 		return;
 
 	va_start(args, fmt);
-	bpf_verifier_vlog(&verifier_log, fmt, args);
+	if (bpf_verifier_log_needed(&verifier_log))
+		bpf_verifier_vlog(&verifier_log, fmt, args);
 	va_end(args);
 }
 
@@ -223,6 +225,8 @@ static const char * const reg_type_str[] = {
 	[PTR_TO_STACK]		= "fp",
 	[PTR_TO_PACKET]		= "pkt",
 	[PTR_TO_PACKET_END]	= "pkt_end",
+	[PTR_TO_MEM]		= "mem",
+	[PTR_TO_MEM_OR_NULL]	= "mem_or_null",
 };
 
 #define __BPF_FUNC_STR_FN(x) [BPF_FUNC_ ## x] = __stringify(bpf_ ## x)
@@ -546,7 +550,25 @@ static int copy_verifier_state(struct bpf_verifier_state *dst,
 	if (err)
 		return err;
 	memcpy(dst, src, offsetof(struct bpf_verifier_state, allocated_stack));
+	/* bounded loop accounting lives past 'allocated_stack' so it is not
+	 * covered by the memcpy() above
+	 */
+	dst->branches = src->branches;
+	dst->branch_parent = src->branch_parent;
 	return copy_stack_state(dst, src);
+}
+
+/* Called when a state reaches bpf_exit (or is pruned): one exploration path
+ * of that state finished.  Walk up the branch parentage chain decrementing the
+ * outstanding-branch counters until a state that still has work left is found.
+ */
+static void update_branch_counts(struct bpf_verifier_state *st)
+{
+	while (st) {
+		if (--st->branches)
+			break;
+		st = st->branch_parent;
+	}
 }
 
 static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
@@ -601,6 +623,11 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		verbose("BPF program is too complex\n");
 		goto err;
 	}
+	/* This new state is a second path branching off our branch parent, so
+	 * the parent now has two outstanding paths to explore.
+	 */
+	if (elem->st.branch_parent)
+		++elem->st.branch_parent->branches;
 	return &elem->st;
 err:
 	/* pop all elements and return */
@@ -1426,6 +1453,21 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		err = check_packet_access(env, regno, off, size);
 		if (!err && t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(regs, value_regno);
+	} else if (reg->type == PTR_TO_MEM) {
+		s64 mem_off;
+
+		if (!tnum_is_const(reg->var_off)) {
+			verbose("variable offset access into ringbuf memory prohibited\n");
+			return -EACCES;
+		}
+		mem_off = off + reg->var_off.value;
+		if (mem_off < 0 || mem_off + size > reg->mem_size) {
+			verbose("invalid access to ringbuf memory, mem_size=%u off=%lld size=%d\n",
+				reg->mem_size, mem_off, size);
+			return -EACCES;
+		}
+		if (t == BPF_READ && value_regno >= 0)
+			mark_reg_unknown(regs, value_regno);
 	} else {
 		verbose("R%d invalid mem access '%s'\n",
 			regno, reg_type_str[reg->type]);
@@ -1608,7 +1650,8 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 		if (type != PTR_TO_PACKET && type != expected_type)
 			goto err_type;
 	} else if (arg_type == ARG_CONST_SIZE ||
-		   arg_type == ARG_CONST_SIZE_OR_ZERO) {
+		   arg_type == ARG_CONST_SIZE_OR_ZERO ||
+		   arg_type == ARG_CONST_ALLOC_SIZE_OR_ZERO) {
 		expected_type = SCALAR_VALUE;
 		if (type != expected_type)
 			goto err_type;
@@ -1623,6 +1666,10 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 		err = check_ctx_reg(env, reg, regno);
 		if (err < 0)
 			return err;
+	} else if (arg_type == ARG_PTR_TO_ALLOC_MEM) {
+		expected_type = PTR_TO_MEM;
+		if (type != expected_type)
+			goto err_type;
 	} else if (arg_type == ARG_PTR_TO_MEM ||
 		   arg_type == ARG_PTR_TO_UNINIT_MEM) {
 		expected_type = PTR_TO_STACK;
@@ -1644,6 +1691,16 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 	if (arg_type == ARG_CONST_MAP_PTR) {
 		/* bpf_map_xxx(map_ptr) call: remember that map_ptr */
 		meta->map_ptr = reg->map_ptr;
+	} else if (arg_type == ARG_CONST_ALLOC_SIZE_OR_ZERO) {
+		/* bpf_ringbuf_reserve() size argument: bounds-check the
+		 * requested allocation size and remember it, so that the
+		 * returned PTR_TO_MEM_OR_NULL register carries mem_size.
+		 */
+		if (reg->smin_value < 0 || reg->umax_value >= BPF_MAX_VAR_SIZ) {
+			verbose("R%d invalid allocation size\n", regno);
+			return -EACCES;
+		}
+		meta->msize_max_value = reg->umax_value;
 	} else if (arg_type == ARG_PTR_TO_MAP_KEY) {
 		/* bpf_map_xxx(..., map_ptr, ..., key) call:
 		 * check that [key, key + map->key_size) are within
@@ -1780,6 +1837,12 @@ static int check_map_func_compatibility(struct bpf_map *map, int func_id)
 		    func_id != BPF_FUNC_map_delete_elem)
 			goto error;
 		break;
+	case BPF_MAP_TYPE_RINGBUF:
+		if (func_id != BPF_FUNC_ringbuf_output &&
+		    func_id != BPF_FUNC_ringbuf_reserve &&
+		    func_id != BPF_FUNC_ringbuf_query)
+			goto error;
+		break;
 	default:
 		break;
 	}
@@ -1815,6 +1878,12 @@ static int check_map_func_compatibility(struct bpf_map *map, int func_id)
 		break;
 	case BPF_FUNC_sock_map_update:
 		if (map->map_type != BPF_MAP_TYPE_SOCKMAP)
+			goto error;
+		break;
+	case BPF_FUNC_ringbuf_output:
+	case BPF_FUNC_ringbuf_reserve:
+	case BPF_FUNC_ringbuf_query:
+		if (map->map_type != BPF_MAP_TYPE_RINGBUF)
 			goto error;
 		break;
 	default:
@@ -1983,6 +2052,14 @@ static int check_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
 			insn_aux->map_ptr = meta.map_ptr;
 		else if (insn_aux->map_ptr != meta.map_ptr)
 			insn_aux->map_ptr = BPF_MAP_PTR_POISON;
+	} else if (fn->ret_type == RET_PTR_TO_ALLOC_MEM_OR_NULL) {
+		/* bpf_ringbuf_reserve() returns a pointer to dynamically
+		 * allocated ring buffer memory or NULL
+		 */
+		mark_reg_known_zero(regs, BPF_REG_0);
+		regs[BPF_REG_0].type = PTR_TO_MEM_OR_NULL;
+		regs[BPF_REG_0].mem_size = meta.msize_max_value;
+		regs[BPF_REG_0].id = ++env->id_gen;
 	} else {
 		verbose("unknown return type %d of func %s#%d\n",
 			fn->ret_type, func_id_name(func_id), func_id);
@@ -3316,6 +3393,23 @@ static void mark_map_reg(struct bpf_reg_state *regs, u32 regno, u32 id,
 		 */
 		reg->id = 0;
 	}
+
+	if (reg->type == PTR_TO_MEM_OR_NULL && reg->id == id) {
+		/* PTR_TO_MEM_OR_NULL returned by bpf_ringbuf_reserve() does
+		 * not carry a map_ptr, so it must be handled separately.
+		 */
+		if (WARN_ON_ONCE(reg->smin_value || reg->smax_value ||
+				 !tnum_equals_const(reg->var_off, 0) ||
+				 reg->off)) {
+			__mark_reg_known_zero(reg);
+			reg->off = 0;
+		}
+		if (is_null)
+			reg->type = SCALAR_VALUE;
+		else
+			reg->type = PTR_TO_MEM;
+		reg->id = 0;
+	}
 }
 
 /* The logic is similar to find_good_pkt_pointers(), both could eventually
@@ -3494,18 +3588,12 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	return 0;
 }
 
-/* return the map pointer stored inside BPF_LD_IMM64 instruction */
-static struct bpf_map *ld_imm64_to_map_ptr(struct bpf_insn *insn)
-{
-	u64 imm64 = ((u64) (u32) insn[0].imm) | ((u64) (u32) insn[1].imm) << 32;
-
-	return (struct bpf_map *) (unsigned long) imm64;
-}
-
 /* verify BPF_LD_IMM64 instruction */
 static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
+	struct bpf_insn_aux_data *aux = cur_aux(env);
 	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_map *map;
 	int err;
 
 	if (BPF_SIZE(insn->code) != BPF_DW) {
@@ -3529,11 +3617,20 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		return 0;
 	}
 
-	/* replace_map_fd_with_map_ptr() should have caught bad ld_imm64 */
-	BUG_ON(insn->src_reg != BPF_PSEUDO_MAP_FD);
+	map = env->used_maps[aux->map_index];
+	mark_reg_known_zero(regs, insn->dst_reg);
+	regs[insn->dst_reg].map_ptr = map;
 
-	regs[insn->dst_reg].type = CONST_PTR_TO_MAP;
-	regs[insn->dst_reg].map_ptr = ld_imm64_to_map_ptr(insn);
+	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE) {
+		regs[insn->dst_reg].type = PTR_TO_MAP_VALUE;
+		regs[insn->dst_reg].off = aux->map_off;
+	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD) {
+		regs[insn->dst_reg].type = CONST_PTR_TO_MAP;
+	} else {
+		verbose("bpf verifier is misconfigured\n");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -3710,8 +3807,10 @@ static int *insn_state;
  * t - index of current instruction
  * w - next instruction
  * e - edge
+ * loop_ok - this edge may be a back-edge closing a bounded loop
  */
-static int push_insn(int t, int w, int e, struct bpf_verifier_env *env)
+static int push_insn(int t, int w, int e, struct bpf_verifier_env *env,
+		     bool loop_ok)
 {
 	if (e == FALLTHROUGH && insn_state[t] >= (DISCOVERED | FALLTHROUGH))
 		return 0;
@@ -3737,6 +3836,13 @@ static int push_insn(int t, int w, int e, struct bpf_verifier_env *env)
 		insn_stack[cur_stack++] = w;
 		return 1;
 	} else if ((insn_state[w] & 0xF0) == DISCOVERED) {
+		/* back-edge: a loop.  Accept it only when the caller declared
+		 * this edge loop-capable and the loader is trusted to be
+		 * allowed to leak pointers (i.e. a privileged load).  Loops are
+		 * then validated by simulating their iterations in do_check().
+		 */
+		if (loop_ok && env->allow_ptr_leaks)
+			return 0;
 		verbose("back-edge from insn %d to %d\n", t, w);
 		return -EINVAL;
 	} else if (insn_state[w] == EXPLORED) {
@@ -3784,7 +3890,7 @@ peek_stack:
 		if (opcode == BPF_EXIT) {
 			goto mark_explored;
 		} else if (opcode == BPF_CALL) {
-			ret = push_insn(t, t + 1, FALLTHROUGH, env);
+			ret = push_insn(t, t + 1, FALLTHROUGH, env, false);
 			if (ret == 1)
 				goto peek_stack;
 			else if (ret < 0)
@@ -3798,7 +3904,7 @@ peek_stack:
 			}
 			/* unconditional jump with single edge */
 			ret = push_insn(t, t + insns[t].off + 1,
-					FALLTHROUGH, env);
+					FALLTHROUGH, env, true);
 			if (ret == 1)
 				goto peek_stack;
 			else if (ret < 0)
@@ -3811,13 +3917,14 @@ peek_stack:
 		} else {
 			/* conditional jump with two edges */
 			env->explored_states[t] = STATE_LIST_MARK;
-			ret = push_insn(t, t + 1, FALLTHROUGH, env);
+			ret = push_insn(t, t + 1, FALLTHROUGH, env, true);
 			if (ret == 1)
 				goto peek_stack;
 			else if (ret < 0)
 				goto err_free;
 
-			ret = push_insn(t, t + insns[t].off + 1, BRANCH, env);
+			ret = push_insn(t, t + insns[t].off + 1, BRANCH, env,
+					true);
 			if (ret == 1)
 				goto peek_stack;
 			else if (ret < 0)
@@ -3827,7 +3934,7 @@ peek_stack:
 		/* all other non-branch instructions with single
 		 * fall-through edge
 		 */
-		ret = push_insn(t, t + 1, FALLTHROUGH, env);
+		ret = push_insn(t, t + 1, FALLTHROUGH, env, false);
 		if (ret == 1)
 			goto peek_stack;
 		else if (ret < 0)
@@ -4175,12 +4282,30 @@ static void propagate_liveness(const struct bpf_verifier_state *state,
 	}
 }
 
+/* Cheap pre-check for "could these two states be part of a non-terminating
+ * loop?".  It compares every register byte-exactly while ignoring the
+ * liveness marks, which is much cheaper than a full states_equal() walk.  A
+ * true result only means "worth calling states_equal() to confirm".
+ */
+static bool states_maybe_looping(struct bpf_verifier_state *old,
+				 struct bpf_verifier_state *cur)
+{
+	int i;
+
+	for (i = 0; i < MAX_BPF_REG; i++)
+		if (memcmp(&old->regs[i], &cur->regs[i],
+			   offsetof(struct bpf_reg_state, live)))
+			return false;
+	return true;
+}
+
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl;
 	struct bpf_verifier_state *cur = env->cur_state;
 	int i, err;
+	bool add_new_state = false;
 
 	sl = env->explored_states[insn_idx];
 	if (!sl)
@@ -4189,7 +4314,43 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		 */
 		return 0;
 
+	/* BPF programs typically reach a pruning point every 4 instructions.
+	 * Do not record a state for future pruning until we have seen at
+	 * least 2 jumps and 8 instructions; this keeps the number of stored
+	 * states (and therefore verifier memory and time) down without losing
+	 * the states that are actually useful for pruning.
+	 */
+	if (env->jmps_processed - env->prev_jmps_processed >= 2 &&
+	    env->insn_processed - env->prev_insn_processed >= 8)
+		add_new_state = true;
+
 	while (sl != STATE_LIST_MARK) {
+		if (sl->state.branches) {
+			/* This recorded state still has paths left to explore,
+			 * which means we are inside a loop that revisits this
+			 * instruction.  Two cases:
+			 *
+			 * 1) the loop can never finish -> reject
+			 * 2) it can, but we are on another iteration
+			 */
+			if (states_maybe_looping(&sl->state, cur) &&
+			    states_equal(env, &sl->state, cur)) {
+				verbose("infinite loop detected at insn %d\n",
+					insn_idx);
+				return -EINVAL;
+			}
+			/* Consecutive loop iterations have distinct states, so
+			 * recording every one of them rarely helps pruning and
+			 * blows up memory.  Throttle state recording while a
+			 * loop is hot, but keep the threshold low enough that a
+			 * loop with a huge trip count still hits the
+			 * complexity limit quickly.
+			 */
+			if (env->jmps_processed - env->prev_jmps_processed < 20 &&
+			    env->insn_processed - env->prev_insn_processed < 100)
+				add_new_state = false;
+			goto miss;
+		}
 		if (states_equal(env, &sl->state, cur)) {
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -4207,15 +4368,25 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		sl = sl->next;
 	}
 
-	/* there were no equivalent states, remember current one.
-	 * technically the current state is not proven to be safe yet,
-	 * but it will either reach bpf_exit (which means it's safe) or
-	 * it will be rejected. Since there are no loops, we won't be
-	 * seeing this 'insn_idx' instruction again on the way to bpf_exit
+miss:
+	if (!add_new_state)
+		/* Not recording this state, so it can neither prune a later
+		 * path nor be pruned by an earlier one.  That is always safe,
+		 * it only costs exploration effort.
+		 */
+		return 0;
+
+	/* There were no equivalent states, remember the current one.
+	 * Technically the current state is not proven to be safe yet, but it
+	 * will either reach bpf_exit (which means it's safe) or it will be
+	 * rejected.  When looping, this state will not be considered for
+	 * equivalence until its 'branches' count drops back to zero.
 	 */
 	new_sl = kzalloc(sizeof(struct bpf_verifier_state_list), GFP_KERNEL);
 	if (!new_sl)
 		return -ENOMEM;
+	env->prev_jmps_processed = env->jmps_processed;
+	env->prev_insn_processed = env->insn_processed;
 
 	/* add new state to the head of linked list */
 	err = copy_verifier_state(&new_sl->state, cur);
@@ -4228,6 +4399,10 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	env->explored_states[insn_idx] = new_sl;
 	/* connect new state to parentage chain */
 	cur->parent = &new_sl->state;
+	/* The clone is the branch parent of everything that descends from
+	 * here; it starts with exactly one outstanding path (this one).
+	 */
+	cur->branch_parent = &new_sl->state;
 	/* clear write marks in current state: the writes we did are not writes
 	 * our child did, so they don't screen off its reads from us.
 	 * (There are no read marks in current state, because reads always mark
@@ -4260,7 +4435,6 @@ static int do_check(struct bpf_verifier_env *env)
 	struct bpf_insn *insns = env->prog->insnsi;
 	struct bpf_reg_state *regs;
 	int insn_cnt = env->prog->len;
-	int insn_processed = 0;
 	bool do_print_state = false;
 
 	state = kzalloc(sizeof(struct bpf_verifier_state), GFP_KERNEL);
@@ -4269,6 +4443,9 @@ static int do_check(struct bpf_verifier_env *env)
 	env->cur_state = state;
 	init_reg_state(state->regs);
 	state->parent = NULL;
+	state->branch_parent = NULL;
+	/* Exactly one path (this one) is being explored from the root state. */
+	state->branches = 1;
 	for (;;) {
 		struct bpf_insn *insn;
 		u8 class;
@@ -4283,9 +4460,9 @@ static int do_check(struct bpf_verifier_env *env)
 		insn = &insns[env->insn_idx];
 		class = BPF_CLASS(insn->code);
 
-		if (++insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
 			verbose("BPF program is too large. Processed %d insn\n",
-				insn_processed);
+				env->insn_processed);
 			return -E2BIG;
 		}
 
@@ -4453,6 +4630,8 @@ static int do_check(struct bpf_verifier_env *env)
 		} else if (class == BPF_JMP) {
 			u8 opcode = BPF_OP(insn->code);
 
+			env->jmps_processed++;
+
 			if (opcode == BPF_CALL) {
 				if (BPF_SRC(insn->code) != BPF_K ||
 				    insn->off != 0 ||
@@ -4506,6 +4685,12 @@ static int do_check(struct bpf_verifier_env *env)
 				if (err)
 					return err;
 process_bpf_exit:
+				/* This path is finished; account for it in the
+				 * branch parentage chain so that a recorded state
+				 * only becomes eligible for pruning once all of
+				 * its descendant paths are done.
+				 */
+				update_branch_counts(env->cur_state);
 				err = pop_stack(env, &env->prev_insn_idx, &env->insn_idx);
 				if (err < 0) {
 					if (err != -ENOENT)
@@ -4548,7 +4733,7 @@ process_bpf_exit:
 	}
 
 	verbose("processed %d insns, stack depth %d\n",
-		insn_processed, env->prog->aux->stack_depth);
+		env->insn_processed, env->prog->aux->stack_depth);
 	return 0;
 }
 
@@ -4611,8 +4796,10 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 		}
 
 		if (insn[0].code == (BPF_LD | BPF_IMM | BPF_DW)) {
+			struct bpf_insn_aux_data *aux;
 			struct bpf_map *map;
 			struct fd f;
+			u64 addr;
 
 			if (i == insn_cnt - 1 || insn[1].code != 0 ||
 			    insn[1].dst_reg != 0 || insn[1].src_reg != 0 ||
@@ -4625,16 +4812,22 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 				/* valid generic load 64-bit imm */
 				goto next_insn;
 
-			if (insn->src_reg != BPF_PSEUDO_MAP_FD) {
+			/* In the final convert_pseudo_ld_imm64() step, this is
+			 * converted into regular 64-bit imm load insn.
+			 */
+			if ((insn[0].src_reg != BPF_PSEUDO_MAP_FD &&
+			     insn[0].src_reg != BPF_PSEUDO_MAP_VALUE) ||
+			    (insn[0].src_reg == BPF_PSEUDO_MAP_FD &&
+			     insn[1].imm != 0)) {
 				verbose("unrecognized bpf_ld_imm64 insn\n");
 				return -EINVAL;
 			}
 
-			f = fdget(insn->imm);
+			f = fdget(insn[0].imm);
 			map = __bpf_map_get(f);
 			if (IS_ERR(map)) {
 				verbose("fd %d is not pointing to valid bpf_map\n",
-					insn->imm);
+					insn[0].imm);
 				return PTR_ERR(map);
 			}
 
@@ -4644,13 +4837,48 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 				return err;
 			}
 
-			/* store map pointer inside BPF_LD_IMM64 instruction */
-			insn[0].imm = (u32) (unsigned long) map;
-			insn[1].imm = ((u64) (unsigned long) map) >> 32;
+			aux = &env->insn_aux_data[i];
+			if (insn[0].src_reg == BPF_PSEUDO_MAP_FD) {
+				addr = (unsigned long)map;
+			} else {
+				u32 off = insn[1].imm;
+
+				if (off >= BPF_MAX_VAR_OFF) {
+					verbose("direct value offset of %u is not allowed\n",
+						off);
+					fdput(f);
+					return -EINVAL;
+				}
+
+				if (!map->ops->map_direct_value_addr) {
+					verbose("no direct value access support for this map type\n");
+					fdput(f);
+					return -EINVAL;
+				}
+
+				err = map->ops->map_direct_value_addr(map,
+								     &addr, off);
+				if (err) {
+					verbose("invalid access to map value pointer, value_size=%u off=%u\n",
+						map->value_size, off);
+					fdput(f);
+					return err;
+				}
+
+				aux->map_off = off;
+				addr += off;
+			}
+
+			/* store map (or map value) pointer inside the
+			 * BPF_LD_IMM64 instruction
+			 */
+			insn[0].imm = (u32)addr;
+			insn[1].imm = addr >> 32;
 
 			/* check whether we recorded this map already */
 			for (j = 0; j < env->used_map_cnt; j++)
 				if (env->used_maps[j] == map) {
+					aux->map_index = j;
 					fdput(f);
 					goto next_insn;
 				}
@@ -4670,6 +4898,7 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 				fdput(f);
 				return PTR_ERR(map);
 			}
+			aux->map_index = env->used_map_cnt;
 			env->used_maps[env->used_map_cnt++] = map;
 
 			fdput(f);
@@ -5224,11 +5453,14 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 	if (!env->explored_states)
 		goto skip_full_check;
 
+	/* Must be decided before check_cfg(): push_insn() only accepts a
+	 * back-edge (i.e. a loop) when the loader is privileged.
+	 */
+	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
+
 	ret = check_cfg(env);
 	if (ret < 0)
 		goto skip_full_check;
-
-	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
 
 	ret = do_check(env);
 	if (env->cur_state) {

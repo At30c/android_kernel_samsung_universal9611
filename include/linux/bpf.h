@@ -16,10 +16,12 @@
 #include <linux/rbtree_latch.h>
 #include <linux/numa.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
 
 struct perf_event;
 struct bpf_prog;
 struct bpf_map;
+struct btf;
 
 /* map is generic key/value storage optionally accesible by eBPF programs */
 struct bpf_map_ops {
@@ -45,7 +47,12 @@ struct bpf_map_ops {
 	 */
 	void (*map_fd_put_ptr)(struct bpf_map *map, void *ptr, bool need_defer);
 	u32 (*map_gen_lookup)(struct bpf_map *map, struct bpf_insn *insn_buf);
+	int (*map_direct_value_addr)(const struct bpf_map *map, u64 *imm,
+				     u32 off);
 	u32 (*map_fd_sys_lookup_elem)(void *ptr);
+	int (*map_mmap)(struct bpf_map *map, struct vm_area_struct *vma);
+	unsigned int (*map_poll)(struct bpf_map *map, struct file *filp,
+				 struct poll_table_struct *pts);
 };
 
 struct bpf_map {
@@ -65,8 +72,11 @@ struct bpf_map {
 	u32 pages;
 	u32 id;
 	int numa_node;
+	u32 btf_key_type_id;
+	u32 btf_value_type_id;
+	struct btf *btf;
 	bool unpriv_array;
-	/* 7 bytes hole */
+	/* 55 bytes hole */
 
 	/* 2nd cacheline with misc members to avoid false sharing
 	 * particularly with refcounting.
@@ -97,9 +107,11 @@ enum bpf_arg_type {
 				 * helper function must fill all bytes or clear
 				 * them in error case.
 				 */
+	ARG_PTR_TO_ALLOC_MEM,	/* pointer returned by ringbuf_reserve */
 
 	ARG_CONST_SIZE,		/* number of bytes accessed from memory */
 	ARG_CONST_SIZE_OR_ZERO,	/* number of bytes accessed from memory or 0 */
+	ARG_CONST_ALLOC_SIZE_OR_ZERO,	/* size returned by an allocating helper */
 
 	ARG_PTR_TO_CTX,		/* pointer to context */
 	ARG_ANYTHING,		/* any (initialized) argument is ok */
@@ -110,6 +122,7 @@ enum bpf_return_type {
 	RET_INTEGER,			/* function returns integer */
 	RET_VOID,			/* function doesn't return anything */
 	RET_PTR_TO_MAP_VALUE_OR_NULL,	/* returns a pointer to map elem value or NULL */
+	RET_PTR_TO_ALLOC_MEM_OR_NULL,	/* returns dynamically allocated memory or NULL */
 };
 
 /* eBPF function prototype used by verifier to allow BPF_CALLs from eBPF programs
@@ -159,6 +172,8 @@ enum bpf_reg_type {
 	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
 	PTR_TO_PACKET,		 /* reg points to skb->data */
 	PTR_TO_PACKET_END,	 /* skb->data + headlen */
+	PTR_TO_MEM,		 /* reg points to dynamically allocated memory */
+	PTR_TO_MEM_OR_NULL,	 /* points to dynamically allocated memory or NULL */
 };
 
 /* The information passed from prog-specific *_is_valid_access
@@ -559,6 +574,11 @@ static inline int sock_map_prog(struct bpf_map *map,
 extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
 extern const struct bpf_func_proto bpf_map_update_elem_proto;
 extern const struct bpf_func_proto bpf_map_delete_elem_proto;
+extern const struct bpf_func_proto bpf_ringbuf_output_proto;
+extern const struct bpf_func_proto bpf_ringbuf_reserve_proto;
+extern const struct bpf_func_proto bpf_ringbuf_submit_proto;
+extern const struct bpf_func_proto bpf_ringbuf_discard_proto;
+extern const struct bpf_func_proto bpf_ringbuf_query_proto;
 
 extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
 extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
@@ -566,6 +586,7 @@ extern const struct bpf_func_proto bpf_get_numa_node_id_proto;
 extern const struct bpf_func_proto bpf_tail_call_proto;
 extern const struct bpf_func_proto bpf_ktime_get_ns_proto;
 extern const struct bpf_func_proto bpf_ktime_get_boot_ns_proto;
+extern const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto;
 extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
 extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;
 extern const struct bpf_func_proto bpf_get_current_comm_proto;

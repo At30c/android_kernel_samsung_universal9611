@@ -3,13 +3,41 @@ import subprocess
 import os
 import shutil
 import re
+import sys
 from datetime import datetime
 import zipfile
 
 class CommandError(Exception):
     pass
 
+DEBUG_BUILD = os.environ.get("KERNEL_BUILD_DEBUG", "0") == "1"
+BUILD_LOG_PATH = os.environ.get("KERNEL_BUILD_LOG", "kernel-build.log")
+
 def run_command(command):
+    if DEBUG_BUILD:
+        output = []
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        with open(BUILD_LOG_PATH, "a", encoding="utf-8") as log_file:
+            for line in process.stdout:
+                output.append(line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_file.write(line)
+                log_file.flush()
+        process.wait()
+        if process.returncode != 0:
+            tail = "".join(output[-200:])
+            raise CommandError(
+                f"Command failed: {command}. Exit code: {process.returncode}\n{tail}"
+            )
+        return "".join(output), "".join(output)
+
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
     if process.returncode != 0:
@@ -73,6 +101,7 @@ def main():
         'CROSS_COMPILE=aarch64-linux-gnu-', 'CC=clang', 'LD=ld.lld', 
         'AS=llvm-as', 'AR=llvm-ar', 'OBJDUMP=llvm-objdump', 
         'READELF=llvm-readelf', 'NM=llvm-nm', 'OBJCOPY=llvm-objcopy', 
+        'KCFLAGS=-Wno-unused-command-line-argument -Wno-default-const-init-field-unsafe -Wno-default-const-init-var-unsafe -Wno-unknown-warning-option',
         'ARCH=arm64', f'-j{os.cpu_count()}'
     ]
  
@@ -155,4 +184,3 @@ def main():
     
 if __name__ == '__main__':
     main()
-
